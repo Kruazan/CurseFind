@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <ncurses.h>
+#include <locale.h>
 
 #define BUFFER_SIZE 4096
 #define HASH_SIZE 32
@@ -37,58 +38,137 @@ int tree_focused = 0; // Начинаем с фокуса на кнопках
 char log_buffer[LOG_CAPACITY];
 int log_length = 0;
 
-// Инициализация лога
-void init_log() {
-    log_buffer[0] = '\0';
-    log_length = 0;
+
+void write_in_logWin() {
+    if (log_win) {
+        werase(log_win);  // Полностью очищаем окно
+        box(log_win, 0, 0);  // Рисуем рамку
+        mvwprintw(log_win, 0, 2, " Log ");  // Заголовок
+
+        int win_height, win_width;
+        getmaxyx(log_win, win_height, win_width);
+        
+        // Сначала подсчитаем общее количество строк в логе
+        int total_lines = 0;
+        char *line = log_buffer;
+        while (*line) {
+            if (strchr(line, '\n')) {
+                total_lines++;
+                line = strchr(line, '\n') + 1;
+            } else {
+                total_lines++;
+                break;
+            }
+        }
+        
+        // Определяем, сколько строк мы можем вывести (высота окна - 2 для рамки)
+        int max_display_lines = win_height - 2;
+        if (max_display_lines <= 0) return;
+        
+        // Вычисляем, с какой строки начинать вывод (пропускаем первые строки, если их слишком много)
+        int start_line = 0;
+        if (total_lines > max_display_lines) {
+            start_line = total_lines - max_display_lines;
+        }
+        
+        // Выводим только нужные строки
+        int current_line = 0;
+        int y = 1;  // Начинаем с первой строки внутри рамки
+        line = log_buffer;
+        while (y < win_height - 1 && *line) {  // -1 чтобы уместиться в окне
+            char *end = strchr(line, '\n');
+            
+            // Пропускаем строки, которые не нужно выводить
+            if (current_line < start_line) {
+                if (end) {
+                    line = end + 1;
+                    current_line++;
+                    continue;
+                } else {
+                    line += strlen(line);
+                    current_line++;
+                    continue;
+                }
+            }
+            
+            if (end) {
+                *end = '\0';  // Временно заменяем \n на \0
+                mvwprintw(log_win, y, 1, "%.*s", win_width - 2, line);  // Вывод с отступом и обрезкой
+                *end = '\n';  // Восстанавливаем \n
+                line = end + 1;
+            } else {
+                mvwprintw(log_win, y, 1, "%.*s", win_width - 2, line);
+                line += strlen(line);
+            }
+            y++;
+            current_line++;
+        }
+    }
 }
 
 void write_to_log(const char* format, ...) {
     va_list args;
     va_start(args, format);
 
-    // 1. Форматируем строку во временный буфер
     char temp_buf[LOG_CAPACITY];
     int written = vsnprintf(temp_buf, sizeof(temp_buf), format, args);
     
     if (written <= 0) {
         va_end(args);
-        return; // Ошибка форматирования
+        return;
     }
 
-    // 2. Убедимся, что строка не превышает максимальную длину
-    if (written >= LOG_CAPACITY) {
-        written = LOG_CAPACITY - 1; // Обрезаем до размера буфера
-    }
-
-    // 3. Сдвигаем существующие данные вправо, освобождая место в начале
+    // Добавляем новое сообщение в конец буфера (а не в начало)
     if (log_length + written >= LOG_CAPACITY) {
-        // Если новый текст не помещается - удаляем часть старых данных
+        // Если не хватает места, удаляем самые старые данные
         int shift = (log_length + written) - (LOG_CAPACITY - 1);
         memmove(log_buffer, log_buffer + shift, log_length - shift);
         log_length -= shift;
     }
 
-    // 4. Вставляем новую строку в начало буфера
-    memmove(log_buffer + written, log_buffer, log_length);
-    memcpy(log_buffer, temp_buf, written);
+    // Добавляем в конец буфера
+    strncpy(log_buffer + log_length, temp_buf, written);
     log_length += written;
-    log_buffer[log_length] = '\0'; // Гарантируем нулевой терминатор
+    log_buffer[log_length] = '\0';
 
-    // 5. Выводим в окно ncurses
-    if (log_win) {
-        werase(log_win); // Очищаем окно
-        scrollok(log_win, TRUE);
-        wprintw(log_win, "%s", log_buffer); // Выводим весь буфер
-        wrefresh(log_win);
-    }
-
+    write_in_logWin();
     va_end(args);
 }
 
+void read_log_from_file() {
+    const char *filename = "duplicate_log.txt";
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        perror("Не удалось открыть файл логов");
+        return;
+    }
+
+    char *buffer = malloc(LOG_CAPACITY);
+    if (!buffer) {
+        perror("Не удалось выделить память");
+        fclose(file);
+        return;
+    }
+
+    size_t bytesRead = fread(buffer, 1, LOG_CAPACITY - 1, file);
+    if (ferror(file)) {
+        perror("Ошибка при чтении файла логов");
+        free(buffer);
+        fclose(file);
+        return;
+    }
+
+    buffer[bytesRead] = '\0';  // Гарантированный null-терминатор
+    fclose(file);
+    write_to_log(buffer);  // Записываем всё в лог
+
+    free(buffer);
+}
+
+
 // Сохранение лога в файл
 void save_log_to_file() {
-    FILE* log_file = fopen("log.txt", "a"); // Открываем для дописывания
+    FILE* log_file = fopen("duplicate_log.txt", "w"); // Открываем для записывания
     if (log_file) {
         fwrite(log_buffer, 1, log_length, log_file);
         fclose(log_file);
@@ -225,8 +305,7 @@ void draw_interface() {
     draw_directory_tree();
     
     log_win = newwin(LINES / 3 - 2, COLS - 2, LINES * 2 / 3 + 2, 1);
-    box(log_win, 0, 0);
-    mvwprintw(log_win, 0, 2, " Log ");
+    write_in_logWin();
     
     // Выводим текущее содержимое буфера
     // if (log_length > 0) {
@@ -253,18 +332,24 @@ void free_hash_table() {
 
 void process_directory(const char* dirPath) {
     // Ваш код обработки директории
-    write_to_log("Directory processing: %s\n", dirPath);
+    write_to_log(" Directory processing: %s\n", dirPath);
+
+    char command[512];
+    snprintf(command, sizeof(command), "./curseFindUtility %s", dirPath);
+    system(command);
+
+    read_log_from_file();
     wrefresh(log_win);
 }
 
 int main(int argc, char* argv[]) {
+    setlocale(LC_ALL, "ru_RU.UTF-8");
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
-
-    init_log();
+    save_log_to_file();
     
     if (argc > 1) {
         strncpy(current_dir, argv[1], MAX_PATH_LENGTH - 1);
